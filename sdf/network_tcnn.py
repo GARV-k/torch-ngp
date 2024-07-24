@@ -6,6 +6,7 @@ import tinycudann as tcnn
 
 class SDFNetwork(nn.Module):
     def __init__(self,
+                 tcnn_network,
                  encoding="hashgrid",
                  num_layers=3,
                  skips=[],
@@ -34,20 +35,21 @@ class SDFNetwork(nn.Module):
             },
         )
 
-        self.backbone = tcnn.Network(
-            n_input_dims=32,
-            n_output_dims=1,
-            network_config={
-                "otype": "FullyFusedMLP",
-                "activation": "ReLU",
-                "output_activation": "None",
-                "n_neurons": hidden_dim,
-                "n_hidden_layers": num_layers - 1,
-            },
-        )
+        # self.backbone = tcnn.Network(
+        #     n_input_dims=32,
+        #     n_output_dims=1,
+        #     network_config={
+        #         "otype": "FullyFusedMLP",
+        #         "activation": "ReLU",
+        #         "output_activation": "None",
+        #         "n_neurons": hidden_dim,
+        #         "n_hidden_layers": num_layers - 1,
+        #     },
+        # )
+        self.backbone = tcnn_network   
 
     
-    def forward(self, x):
+    def forward(self, x):   
         # x: [B, 3]
 
         x = (x + 1) / 2 # to [0, 1]

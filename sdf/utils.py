@@ -46,7 +46,7 @@ def seed_everything(seed):
     #torch.backends.cudnn.benchmark = True
 
 
-def extract_fields(bound_min, bound_max, resolution, query_func):
+def extract_fields(bound_min, bound_max, resolution, query_func, model):
     N = 64
     X = torch.linspace(bound_min[0], bound_max[0], resolution).split(N)
     Y = torch.linspace(bound_min[1], bound_max[1], resolution).split(N)
@@ -59,14 +59,14 @@ def extract_fields(bound_min, bound_max, resolution, query_func):
                 for zi, zs in enumerate(Z):
                     xx, yy, zz = custom_meshgrid(xs, ys, zs)
                     pts = torch.cat([xx.reshape(-1, 1), yy.reshape(-1, 1), zz.reshape(-1, 1)], dim=-1) # [N, 3]
-                    val = query_func(pts).reshape(len(xs), len(ys), len(zs)).detach().cpu().numpy() # [N, 1] --> [x, y, z]
+                    val = query_func(pts, model).reshape(len(xs), len(ys), len(zs)).detach().cpu().numpy() # [N, 1] --> [x, y, z]
                     u[xi * N: xi * N + len(xs), yi * N: yi * N + len(ys), zi * N: zi * N + len(zs)] = val
     return u
 
 
-def extract_geometry(bound_min, bound_max, resolution, threshold, query_func):
+def extract_geometry(bound_min, bound_max, resolution, threshold, query_func, model):
     #print('threshold: {}'.format(threshold))
-    u = extract_fields(bound_min, bound_max, resolution, query_func)
+    u = extract_fields(bound_min, bound_max, resolution, query_func, model)
 
     #print(u.shape, u.max(), u.min(), np.percentile(u, 50))
     
@@ -82,10 +82,12 @@ def extract_geometry(bound_min, bound_max, resolution, threshold, query_func):
 
 class Trainer(object):
     def __init__(self, 
-                 name, # name of this experiment
-                 model, # network 
+                 name,
+                 n,# name of this experiment
+                 models, # network 
                  criterion=None, # loss function, if None, assume inline implementation in train_step
-                 optimizer=None, # optimizer
+                 enc_optimizer=None,
+                 net_optimizer=None,# optimizer
                  ema_decay=None, # if use EMA, set the decay
                  lr_scheduler=None, # scheduler
                  metrics=[], # metrics for evaluation, if None, use val_loss to measure performance, else use the first metric.
@@ -106,6 +108,7 @@ class Trainer(object):
                  ):
         
         self.name = name
+        self.n = n
         self.mute = mute
         self.metrics = metrics
         self.local_rank = local_rank
@@ -125,28 +128,40 @@ class Trainer(object):
         self.device = device if device is not None else torch.device(f'cuda:{local_rank}' if torch.cuda.is_available() else 'cpu')
         self.console = Console()
 
-        model.to(self.device)
-        if self.world_size > 1:
-            model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
-            model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[local_rank])
-        self.model = model
+        for model in models:
+            model.to(self.device)
+            if self.world_size > 1:
+                model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
+                model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[local_rank])
+        self.models = models
 
         if isinstance(criterion, nn.Module):
             criterion.to(self.device)
         self.criterion = criterion
-
-        if optimizer is None:
-            self.optimizer = optim.Adam(self.model.parameters(), lr=0.001, weight_decay=5e-4) # naive adam
-        else:
-            self.optimizer = optimizer(self.model)
-
+        self.enc_optimizers = []
+        self.net_optimizer = net_optimizer(self.models[0])
+        for idx in range(self.n):
+            temp_opt = enc_optimizer(self.models[idx])
+            self.enc_optimizers.append(temp_opt)
+            
+        self.enc_lr_schedulers = []   
+        for optimizer in self.enc_optimizers:
+            if lr_scheduler is None:
+                lr_scheduler1 = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lambda epoch: 1) # fake scheduler
+            else:
+                lr_scheduler1 = lr_scheduler(optimizer)
+            self.enc_lr_schedulers.append(lr_scheduler1)
+        
         if lr_scheduler is None:
-            self.lr_scheduler = optim.lr_scheduler.LambdaLR(self.optimizer, lr_lambda=lambda epoch: 1) # fake scheduler
+            self.net_lr_scheduler = optim.lr_scheduler.LambdaLR(self.net_optimizer, lr_lambda=lambda epoch: 1) # fake scheduler   
         else:
-            self.lr_scheduler = lr_scheduler(self.optimizer)
+            self.net_lr_scheduler = lr_scheduler(self.net_optimizer)        
 
+        self.emas= []
         if ema_decay is not None:
-            self.ema = ExponentialMovingAverage(self.model.parameters(), decay=ema_decay)
+            for model in self.models:
+                ema = ExponentialMovingAverage(model.parameters(), decay=ema_decay)
+                self.emas.append(ema)
         else:
             self.ema = None
 
@@ -180,7 +195,7 @@ class Trainer(object):
             os.makedirs(self.ckpt_path, exist_ok=True)
             
         self.log(f'[INFO] Trainer: {self.name} | {self.time_stamp} | {self.device} | {"fp16" if self.fp16 else "fp32"} | {self.workspace}')
-        self.log(f'[INFO] #parameters: {sum([p.numel() for p in model.parameters() if p.requires_grad])}')
+        self.log(f'[INFO] #parameters: {sum([p.numel() for p in models[0].parameters() if p.requires_grad])}')
 
         if self.workspace is not None:
             if self.use_checkpoint == "scratch":
@@ -214,71 +229,90 @@ class Trainer(object):
 
     ### ------------------------------	
 
-    def train_step(self, data):
+    def train_step(self, data, model):
         # assert batch_size == 1
         X = data["points"][0] # [B, 3]
         y = data["sdfs"][0] # [B]
         
-        pred = self.model(X)
+        #pred = self.model(X)
+        pred = model(X)
         loss = self.criterion(pred, y)
 
         return pred, y, loss
 
-    def eval_step(self, data):
-        return self.train_step(data)
+    def eval_step(self, data,model):
+        return self.train_step(data,model)
 
-    def test_step(self, data):  
+    def test_step(self, data,model):  
         X = data["points"][0]
-        pred = self.model(X)
+        pred = model(X)
         return pred        
 
     def save_mesh(self, save_path=None, resolution=256):
+        for j, model in enumerate(self.models):
+            if save_path is None:
+                save_path = os.path.join(self.workspace, 'validation', f'{self.name}_{self.epoch}_{j}.obj')
+            else: 
+                save_path = save_path[:-4]+f'_{j}.obj'
+            self.log(f"==> Saving mesh to {save_path}")
 
-        if save_path is None:
-            save_path = os.path.join(self.workspace, 'validation', f'{self.name}_{self.epoch}.ply')
+            os.makedirs(os.path.dirname(save_path), exist_ok=True)
 
-        self.log(f"==> Saving mesh to {save_path}")
+            def query_func(pts,model):
+                pts = pts.to(self.device)
+                with torch.no_grad():   
+                    with torch.cuda.amp.autocast(enabled=self.fp16):
+                        sdfs = model(pts) #TODO
+                return sdfs
 
-        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+            bounds_min = torch.FloatTensor([-1, -1, -1])
+            bounds_max = torch.FloatTensor([1, 1, 1])
+            
+            vertices, triangles = extract_geometry(bounds_min, bounds_max, resolution=resolution, threshold=0, query_func=query_func, model=model)
+            mesh = trimesh.Trimesh(vertices, triangles, process=False)
+            mesh.export(save_path)
+        # vertices, triangles = extract_geometry(bounds_min, bounds_max, resolution=resolution, threshold=0, query_func=query_func)
 
-        def query_func(pts):
-            pts = pts.to(self.device)
-            with torch.no_grad():
-                with torch.cuda.amp.autocast(enabled=self.fp16):
-                    sdfs = self.model(pts)
-            return sdfs
-
-        bounds_min = torch.FloatTensor([-1, -1, -1])
-        bounds_max = torch.FloatTensor([1, 1, 1])
-
-        vertices, triangles = extract_geometry(bounds_min, bounds_max, resolution=resolution, threshold=0, query_func=query_func)
-
-        mesh = trimesh.Trimesh(vertices, triangles, process=False) # important, process=True leads to seg fault...
-        mesh.export(save_path)
+        # mesh = trimesh.Trimesh(vertices, triangles, process=False) # important, process=True leads to seg fault...
+        # mesh.export(save_path)
 
         self.log(f"==> Finished saving mesh.")
 
     ### ------------------------------
 
-    def train(self, train_loader, valid_loader, max_epochs):
+    def train(self, train_loaders, valid_loaders, max_epochs):
         if self.use_tensorboardX and self.local_rank == 0:
             self.writer = tensorboardX.SummaryWriter(os.path.join(self.workspace, "run", self.name))
         
         for epoch in range(self.epoch + 1, max_epochs + 1):
-            self.epoch = epoch
+        #     self.epoch = epoch
 
-            self.train_one_epoch(train_loader)
+        #     self.train_one_epoch(train_loader)
 
-            if self.workspace is not None and self.local_rank == 0:
-                self.save_checkpoint(full=True, best=False)
+        #     if self.workspace is not None and self.local_rank == 0:
+        #         self.save_checkpoint(full=True, best=False)
 
-            if self.epoch % self.eval_interval == 0:
-                self.evaluate_one_epoch(valid_loader)
-                self.save_mesh()
-                self.save_checkpoint(full=False, best=True)
+        #     if self.epoch % self.eval_interval == 0:
+        #         self.evaluate_one_epoch(valid_loader)
+        #         self.save_mesh()
+        #         self.save_checkpoint(full=False, best=True)
+
+        # if self.use_tensorboardX and self.local_rank == 0:
+        #     self.writer.close()
+                self.epoch = epoch
+
+                self.train_one_epoch(train_loaders,self.models)
+
+                # if self.workspace is not None and self.local_rank == 0:
+                #     self.save_checkpoint(full=True, best=False)
+
+                if self.epoch % self.eval_interval == 0:
+                    self.evaluate_one_epoch(valid_loaders)
+                    self.save_mesh()
+                    #self.save_checkpoint(full=False, best=True)
 
         if self.use_tensorboardX and self.local_rank == 0:
-            self.writer.close()
+                self.writer.close()
 
     def evaluate(self, loader):
         #if os.path.exists(self.best_path):
@@ -311,49 +345,62 @@ class Trainer(object):
 
         return data
 
-    def train_one_epoch(self, loader):
-        self.log(f"==> Start Training Epoch {self.epoch}, lr={self.optimizer.param_groups[0]['lr']:.6f} ...")
+    def train_one_epoch(self, loaders, models):
+        self.log(f"==> Start Training Epoch {self.epoch}, lr={self.enc_optimizers[0].param_groups[0]['lr']:.6f} ...")
 
         total_loss = 0
         if self.local_rank == 0 and self.report_metric_at_train:
             for metric in self.metrics:
                 metric.clear()
 
-        self.model.train()
+        for model in models:
+            model.train()
 
         # distributedSampler: must call set_epoch() to shuffle indices across multiple epochs
         # ref: https://pytorch.org/docs/stable/data.html
         if self.world_size > 1:
-            loader.sampler.set_epoch(self.epoch)
+            for loader in loaders:
+                loader.sampler.set_epoch(self.epoch)
         
         if self.local_rank == 0:
-            pbar = tqdm.tqdm(total=len(loader) * loader.batch_size, bar_format='{desc}: {percentage:3.0f}% {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]')
-
+            pbar = tqdm.tqdm(total=len(loaders[0]) * loaders[0].batch_size, bar_format='{desc}: {percentage:3.0f}% {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]')
+                
         self.local_step = 0
-
-        for data in loader:
-            
+        N = min([len(loader) for loader in loaders])
+        loaders_iter = [iter(loader) for loader in loaders]
+        for i in range(N):
             self.local_step += 1
             self.global_step += 1
             
-            data = self.prepare_data(data)
+            for enc_opt in self.enc_optimizers:
+                enc_opt.zero_grad()
+            self.net_optimizer.zero_grad()
+                
+            for j, loader_iter in enumerate(loaders_iter):
+                data = next(loader_iter)
+                #model = self.models[j]
+                data = self.prepare_data(data)
+                with torch.cuda.amp.autocast(enabled=self.fp16):
+                    preds, truths, loss = self.train_step(data,self.models[j])
+                
+                self.scaler.scale(loss).backward()
+                loss_val = loss.item()
+                total_loss += loss_val
+                
+            for enc_opt in self.enc_optimizers:
+                self.scaler.step(enc_opt)
+            self.scaler.step(self.net_optimizer)
 
-            self.optimizer.zero_grad()
-
-            with torch.cuda.amp.autocast(enabled=self.fp16):
-                preds, truths, loss = self.train_step(data)
-            self.scaler.scale(loss).backward()
-            self.scaler.step(self.optimizer)
             self.scaler.update()
 
-            if self.ema is not None:
-                self.ema.update()
+            for idx,_ in enumerate(self.models):
+                if self.emas[idx] is not None:
+                    self.emas[idx].update() 
 
             if self.scheduler_update_every_step:
-                self.lr_scheduler.step()
+                [lr_scheduler.step() for lr_scheduler in self.enc_lr_scheduler]
+                self.net_lr_scheduler.step()
 
-            loss_val = loss.item()
-            total_loss += loss_val
 
             if self.local_rank == 0:
                 if self.report_metric_at_train:
@@ -362,13 +409,60 @@ class Trainer(object):
                         
                 if self.use_tensorboardX:
                     self.writer.add_scalar("train/loss", loss_val, self.global_step)
-                    self.writer.add_scalar("train/lr", self.optimizer.param_groups[0]['lr'], self.global_step)
+                    self.writer.add_scalar("train/lr", self.enc_optimizers[0].param_groups[0]['lr'], self.global_step)  #IDC (optimizer)
 
                 if self.scheduler_update_every_step:
-                    pbar.set_description(f"loss={loss_val:.4f} ({total_loss/self.local_step:.4f}), lr={self.optimizer.param_groups[0]['lr']:.6f}")
+                    pbar.set_description(f"loss={loss_val:.4f} ({total_loss/self.local_step:.4f}), lr={self.enc_optimizers[0].param_groups[0]['lr']:.6f}") #IDC (optimizer)
                 else:
                     pbar.set_description(f"loss={loss_val:.4f} ({total_loss/self.local_step:.4f})")
-                pbar.update(loader.batch_size)
+                pbar.update(loaders[0].batch_size)
+            
+        
+        
+        
+        
+        # for idx,loader in enumerate(loaders):
+        #     for data in loader:
+                
+        #         self.local_step += 1
+        #         self.global_step += 1
+                
+        #         data = self.prepare_data(data)
+                
+        #         for enc_opt in self.enc_optimizers:
+        #             enc_opt.zero_grad()
+        #         self.net_optimizer.zero_grad()
+
+        #         with torch.cuda.amp.autocast(enabled=self.fp16):
+        #             preds, truths, loss_loader = self.train_step(data,self.models[idx])
+                    
+        #         self.scaler.scale(loss).backward()
+        #         self.scaler.step(self.optimizer)
+        #         self.scaler.update()
+
+        #         if self.ema is not None:
+        #             self.ema.update()
+
+        #         if self.scheduler_update_every_step:
+        #             self.lr_scheduler.step()
+
+        #         loss_val = loss.item()
+        #         total_loss += loss_val
+
+        #         if self.local_rank == 0:
+        #             if self.report_metric_at_train:
+        #                 for metric in self.metrics:
+        #                     metric.update(preds, truths)
+                            
+        #             if self.use_tensorboardX:
+        #                 self.writer.add_scalar("train/loss", loss_val, self.global_step)
+        #                 self.writer.add_scalar("train/lr", self.optimizer.param_groups[0]['lr'], self.global_step)
+
+        #             if self.scheduler_update_every_step:
+        #                 pbar.set_description(f"loss={loss_val:.4f} ({total_loss/self.local_step:.4f}), lr={self.optimizer.param_groups[0]['lr']:.6f}")
+        #             else:
+        #                 pbar.set_description(f"loss={loss_val:.4f} ({total_loss/self.local_step:.4f})")
+        #             pbar.update(loader.batch_size)
 
         average_loss = total_loss / self.local_step
         self.stats["loss"].append(average_loss)
@@ -383,15 +477,17 @@ class Trainer(object):
                     metric.clear()
 
         if not self.scheduler_update_every_step:
-            if isinstance(self.lr_scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
-                self.lr_scheduler.step(average_loss)
+            if isinstance(self.enc_lr_schedulers[0], torch.optim.lr_scheduler.ReduceLROnPlateau):
+                [lr_scheduler.step(average_loss) for lr_scheduler in self.enc_lr_schedulers]
+                self.net_lr_scheduler.step(average_loss)
             else:
-                self.lr_scheduler.step()
+                [lr_scheduler.step(average_loss) for lr_scheduler in self.enc_lr_schedulers]
+                self.net_lr_scheduler.step()
 
         self.log(f"==> Finished Epoch {self.epoch}.")
 
 
-    def evaluate_one_epoch(self, loader):
+    def evaluate_one_epoch(self, loaders):
         self.log(f"++> Evaluate at epoch {self.epoch} ...")
 
         total_loss = 0
@@ -399,52 +495,96 @@ class Trainer(object):
             for metric in self.metrics:
                 metric.clear()
 
-        self.model.eval()
+        [model.eval() for model in self.models]
 
         if self.local_rank == 0:
-            pbar = tqdm.tqdm(total=len(loader) * loader.batch_size, bar_format='{desc}: {percentage:3.0f}% {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]')
+            pbar = tqdm.tqdm(total=len(loaders[0]) * loaders[0].batch_size, bar_format='{desc}: {percentage:3.0f}% {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]')
 
         with torch.no_grad():
             self.local_step = 0
-            for data in loader:    
+            N = min([len(loader) for loader in loaders])
+            loaders_iter = [iter(loader) for loader in loaders]
+            for i in range(N):
                 self.local_step += 1
-                
-                data = self.prepare_data(data)
-
-                if self.ema is not None:
-                    self.ema.store()
-                    self.ema.copy_to()
-            
-                with torch.cuda.amp.autocast(enabled=self.fp16):
-                    preds, truths, loss = self.eval_step(data)
-
-                if self.ema is not None:
-                    self.ema.restore()
-                
-                # all_gather/reduce the statistics (NCCL only support all_*)
-                if self.world_size > 1:
-                    dist.all_reduce(loss, op=dist.ReduceOp.SUM)
-                    loss = loss / self.world_size
                     
-                    preds_list = [torch.zeros_like(preds).to(self.device) for _ in range(self.world_size)] # [[B, ...], [B, ...], ...]
-                    dist.all_gather(preds_list, preds)
-                    preds = torch.cat(preds_list, dim=0)
+                for j, loader_iter in enumerate(loaders_iter):
+                    if self.emas[j] is not None:  #TODO
+                        self.emas[j].store()
+                        self.emas[j].copy_to()
+                    
+                    data = next(loader_iter)
+                    data = self.prepare_data(data)
+                    with torch.cuda.amp.autocast(enabled=self.fp16):
+                        preds, truths, loss = self.eval_step(data,self.models[j])
+                    
+                    if self.emas[j] is not None:  
+                        self.emas[j].restore()
+                    
+                    if self.world_size > 1:
+                        dist.all_reduce(loss, op=dist.ReduceOp.SUM)
+                        loss = loss / self.world_size
+                        
+                        preds_list = [torch.zeros_like(preds).to(self.device) for _ in range(self.world_size)] # [[B, ...], [B, ...], ...]
+                        dist.all_gather(preds_list, preds)
+                        preds = torch.cat(preds_list, dim=0)
 
-                    truths_list = [torch.zeros_like(truths).to(self.device) for _ in range(self.world_size)] # [[B, ...], [B, ...], ...]
-                    dist.all_gather(truths_list, truths)
-                    truths = torch.cat(truths_list, dim=0)
+                        truths_list = [torch.zeros_like(truths).to(self.device) for _ in range(self.world_size)] # [[B, ...], [B, ...], ...]
+                        dist.all_gather(truths_list, truths)
+                        truths = torch.cat(truths_list, dim=0)
 
-                loss_val = loss.item()
-                total_loss += loss_val
+                    loss_val = loss.item()
+                    total_loss += loss_val
 
-                # only rank = 0 will perform evaluation.
-                if self.local_rank == 0:
+                    # only rank = 0 will perform evaluation.
+                    if self.local_rank == 0:
 
-                    for metric in self.metrics:
-                        metric.update(preds, truths)
+                        for metric in self.metrics:
+                            metric.update(preds, truths)
 
-                    pbar.set_description(f"loss={loss_val:.4f} ({total_loss/self.local_step:.4f})")
-                    pbar.update(loader.batch_size)
+                        pbar.set_description(f"loss={loss_val:.4f} ({total_loss/self.local_step:.4f})")
+                        pbar.update(loaders[j].batch_size)
+
+            
+            # self.local_step = 0
+            # for data in loader:    
+            #     self.local_step += 1
+                
+            #     data = self.prepare_data(data)
+
+            #     if self.ema is not None:  #TODO
+            #         self.ema.store()
+            #         self.ema.copy_to()
+            
+            #     with torch.cuda.amp.autocast(enabled=self.fp16):
+            #         preds, truths, loss = self.eval_step(data)
+
+            #     if self.ema is not None:   #TODO
+            #         self.ema.restore()
+                
+            #     # all_gather/reduce the statistics (NCCL only support all_*)
+            #     if self.world_size > 1:
+            #         dist.all_reduce(loss, op=dist.ReduceOp.SUM)
+            #         loss = loss / self.world_size
+                    
+            #         preds_list = [torch.zeros_like(preds).to(self.device) for _ in range(self.world_size)] # [[B, ...], [B, ...], ...]
+            #         dist.all_gather(preds_list, preds)
+            #         preds = torch.cat(preds_list, dim=0)
+
+            #         truths_list = [torch.zeros_like(truths).to(self.device) for _ in range(self.world_size)] # [[B, ...], [B, ...], ...]
+            #         dist.all_gather(truths_list, truths)
+            #         truths = torch.cat(truths_list, dim=0)
+
+            #     loss_val = loss.item()
+            #     total_loss += loss_val
+
+            #     # only rank = 0 will perform evaluation.
+            #     if self.local_rank == 0:
+
+            #         for metric in self.metrics:
+            #             metric.update(preds, truths)
+
+            #         pbar.set_description(f"loss={loss_val:.4f} ({total_loss/self.local_step:.4f})")
+            #         pbar.update(loader.batch_size)
 
         average_loss = total_loss / self.local_step
         self.stats["valid_loss"].append(average_loss)
